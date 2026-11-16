@@ -62,7 +62,7 @@ Inputs: A (FP64), B (FP64), C (FP64) in GPU VRAM   [column-major cuBLAS layout]
 
 | Section | Symbols (`ozIMMU.cu`) | Key Implementation Details & Notes |
 |---|---|---|
-| **#1** ([`L10`](ozIMMU.cu#L10)) | `padding`, `axpby_kernel<beta_zero>`, `axpby` | `32`-byte ceiling padding; **improvement over `ozIMMU_simple`**: compile-time `if constexpr (beta_zero)` avoids reading uninitialized `C` (`0.0 * NaN = NaN` safety), plus 64-bit `idx % rows` / `idx / rows`. |
+| **#1** ([`L10`](ozIMMU.cu#L10)) | `padding`, `axpby_kernel<beta_zero>`, `axpby` | `32`-byte ceiling padding; compile-time `if constexpr (beta_zero)` avoids reading uninitialized `C` (`0.0 * NaN = NaN` safety), plus 64-bit `idx % rows` / `idx / rows`. |
 | **#2** ([`L67`](ozIMMU.cu#L67)) | `accum_kernel<init>`, `accumulation` | Scales `int32_t` products via `__int2double_rn` + `scalbn(..., sft_C)`. Initializes `C_64f` directly when `idx_A + idx_B == 0` (`init = true`), avoiding an extra zeroing kernel; 64-bit `size_t` indexing (`idx % rows`, `idx / rows`) avoids 32-bit `col * rows` wraparound. |
 | **#3** ([`L116`](ozIMMU.cu#L116)) | `gemm_8i_TN` | `cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, ..., CUBLAS_COMPUTE_32I)` with `blk = 8192` column-panel blocking and `<= 12288` lookahead to prevent tail splits and large-`n` Tensor Core slowdowns. |
 | **#4A** ([`L139`](ozIMMU.cu#L139)) | `UINT_TYPE<numSlice>`, `conv_64f_2_8i_bitmask` | `std::conditional_t` integer selection (`32`/`64`/`128`-bit) and `#pragma unroll` MSB-to-LSB static bitmask extraction. |
@@ -73,20 +73,36 @@ Inputs: A (FP64), B (FP64), C (FP64) in GPU VRAM   [column-major cuBLAS layout]
 
 ---
 
+## Accuracy Verification (`allclose.cuh`)
+
+[`allclose.cuh`](allclose.cuh) provides a modular, PyTorch-style `torch.allclose` checker (`|actual - expected| <= atol + rtol * |expected|`) for any floating-point type across 2D column-major matrices (`m, n, ld`) and 1D contiguous arrays:
+
+- **Automatic host / device detection:** `allclose(...)` inspects `cudaPointerGetAttributes` and copies GPU buffers (with 2D strided `cudaMemcpy2D` when `ld > m`) transparently when either operand lives in device/managed memory; explicit `allclose_host` and `allclose_device` entry points are also available.
+- **Diagnostics (`AllCloseResult`):** Evaluates to `bool` directly and prints pass/fail status, mismatch count/percentage, `max_abs_err`, `max_rel_err`, overflow-safe `frobenius_rel_err`, and the worst `(row, col)` entry.
+
+---
+
 ## Minimal Usage Example
 
-Because `ozIMMU.cu` is self-contained with all device kernels and host wrappers inline, include/compile it with C++20 and link `cublas` (`nvcc -std=c++20 -O3 ... -lcublas -lcudart`):
+Include `ozIMMU.cu` and `allclose.cuh`, compile with C++20, and link `cublas` (`nvcc -std=c++20 -O3 ... -lcublas -lcudart`):
 
 ```cpp
-// Given initialized cublasHandle_t handle and device matrices dA, dB, dC
+#include "ozIMMU.cu"
+#include "allclose.cuh"
+
+// Given initialized cublasHandle_t handle and device matrices dA, dB, dC, dC_ref
 const int numSlice = 8; // 3..18 (~8 slices for FP64-level accuracy)
 void *d_work = nullptr;
 cudaMalloc(&d_work, workSize(m, n, k, numSlice));
 
 double alpha = 1.0, beta = 0.0;
+cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, dA, m, dB, k, &beta, dC_ref, m);
 ozIMMU_EF(handle, CUBLAS_OP_N, CUBLAS_OP_N,
           m, n, k, &alpha, dA, m, dB, k, &beta, dC, m,
           d_work, numSlice);
+
+auto res = allclose(m, n, dC, m, dC_ref, m, /*rtol=*/1e-12, /*atol=*/1e-14);
+res.print("ozIMMU_EF vs cuBLAS");
 
 cudaFree(d_work);
 ```
